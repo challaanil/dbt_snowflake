@@ -1,0 +1,11 @@
+sources:
+  - name: test_dbt
+    database: DATALAKE 
+    schema: DATALAKE_ENG_LANDING
+    tables:
+      - name: EMPLOYEES 
+
+models:
+  - name: employees
+    config:
+      materialized: 'table'
