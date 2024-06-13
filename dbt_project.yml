@@ -4,3 +4,5 @@
 # name or the intended use of these models
 name: 'my_new_project'
 model-paths: ["models"]
+models:
+  materialized: 'table'
