@@ -3,7 +3,7 @@ sources:
     database: DATALAKE 
     schema: DATALAKE_ENG_LANDING
     tables:
-      - name: EMPLOYEES 
+      - name: EMPLOYEES
 
 models:
   - name: employees
