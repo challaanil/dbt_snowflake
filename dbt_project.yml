@@ -5,5 +5,6 @@
 name: 'my_new_project'
 model-paths: ["models"]
 seed-paths: ["seeds"]
+analysis-paths: ["analyses"]
 models:
   materialized: 'table'
