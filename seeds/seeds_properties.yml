@@ -1,0 +1,6 @@
+seeds:
+  - name: us
+    config:
+      column_types:
+        full_refresh: True
+        first_name: varchar(50)

@@ -6,6 +6,9 @@ sources:
       - name: EMPLOYEES
 
 models:
-  - name: employees
+  - name: 'employees'
     config:
       materialized: 'table'
+  - name: 'ephemeral_test'
+    config:
+      materialized: 'ephemeral'
