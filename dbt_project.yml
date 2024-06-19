@@ -9,4 +9,4 @@ model-paths:
 seed-paths: ["seeds"]
 analysis-paths: ["analyses"]
 macro-paths:
-  - macros/DATALAKE_MACROS
+  - macros

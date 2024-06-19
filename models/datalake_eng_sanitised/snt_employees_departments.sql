@@ -1,3 +1,9 @@
+{{ config(
+    materialized = 'table',
+    database = 'DATALAKE',
+    schema = 'DATALAKE_ENG_SANITISED'
+) }}
+
 with employee_department_cte as (
     select 
         emp.EMPLOYEE_ID,

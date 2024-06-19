@@ -1,4 +1,5 @@
 models:
-  - name: 'snt_employees_departments'
+  - name: snt_employees_departments
+    description: "A joined table of employees and their respective departments"
     config:
-      materialized: 'table' 
+      materialized: table

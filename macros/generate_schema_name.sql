@@ -7,7 +7,7 @@
 
     {%- else -%}
 
-        {{ DATALAKE_ENG_SANITISED | trim }}
+        {{ custom_schema_name | trim }}
 
     {%- endif -%}
 
