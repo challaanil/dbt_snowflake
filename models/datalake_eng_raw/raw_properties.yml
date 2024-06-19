@@ -1,0 +1,15 @@
+sources:
+  - name: datalake
+    database: DATALAKE 
+    schema: DATALAKE_ENG_RAWDATA
+    tables:
+      - name: EMPLOYEES
+      - name: DEPARTMENTS
+
+models:
+  - name: 'raw_employees'
+    config:
+      materialized: 'table' 
+  - name: 'raw_department'
+    config:
+      materialized: 'table'

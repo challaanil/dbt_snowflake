@@ -2,8 +2,9 @@
 # Name your project! Project names should contain only lowercase characters
 # and underscores. A good package name should reflect your organization's
 # name or the intended use of these models
-name: 'my_new_project'
-model-paths: ["models"]
+name: 'datalake'
+model-paths: 
+  - models/datalake_eng_raw
 seed-paths: ["seeds"]
 analysis-paths: ["analyses"]
 macro-paths: ["macros"]
