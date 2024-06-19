@@ -13,7 +13,8 @@ with employee_department_cte as (
 finalltable as (
     select 
         {{ lowercase_string('FIRST_NAME') }},
-        {{ lowercase_string('LAST_NAME') }}
+        {{ lowercase_string('LAST_NAME') }},
+        {{ fullname_emp('FIRST_NAME','LAST_NAME') }}
     from employee_department_cte
 )
 
