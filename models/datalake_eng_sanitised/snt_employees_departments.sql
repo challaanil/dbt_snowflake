@@ -1,9 +1,3 @@
-{{ config(
-    materialized = 'table',
-    database = 'DATALAKE',
-    schema = 'DATALAKE_ENG_SANITISED'
-) }}
-
 with employee_department_cte as (
     select 
         emp.EMPLOYEE_ID,
@@ -14,7 +8,13 @@ with employee_department_cte as (
     from {{ ref('lnd_employees') }} emp
     inner join {{ ref('lnd_department') }} dept
     on emp.department_id = dept.department_id
+),
+
+finalltable as (
+    select 
+        {{ lowercase_string('FIRST_NAME') }},
+        {{ lowercase_string('LAST_NAME') }}
+    from employee_department_cte
 )
-select 
-*
-from employee_department_cte
+
+select * from finalltable

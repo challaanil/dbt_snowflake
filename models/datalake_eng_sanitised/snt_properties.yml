@@ -3,3 +3,5 @@ models:
     description: "A joined table of employees and their respective departments"
     config:
       materialized: table
+      database: DATALAKE
+      schema: DATALAKE_ENG_SANITISED
