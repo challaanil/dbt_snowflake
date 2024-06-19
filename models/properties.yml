@@ -1,9 +1,10 @@
 sources:
-  - name: test_dbt
+  - name: 'datalake'
     database: DATALAKE 
-    schema: DATALAKE_ENG_LANDING
+    schema: DATALAKE_ENG_RAWDATA
     tables:
       - name: EMPLOYEES
+      - name: DEPARTMENTS
 
 models:
   - name: 'employees'

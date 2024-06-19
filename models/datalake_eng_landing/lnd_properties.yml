@@ -7,9 +7,9 @@ sources:
       - name: DEPARTMENTS
 
 models:
-  - name: 'raw_employees'
+  - name: 'lnd_employees'
     config:
       materialized: 'table' 
-  - name: 'raw_department'
+  - name: 'lnd_department'
     config:
       materialized: 'table'

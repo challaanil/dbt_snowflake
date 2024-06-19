@@ -1,0 +1,4 @@
+models:
+  - name: 'snt_employees_departments'
+    config:
+      materialized: 'table' 

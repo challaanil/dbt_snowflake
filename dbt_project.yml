@@ -4,9 +4,9 @@
 # name or the intended use of these models
 name: 'datalake'
 model-paths: 
-  - models/datalake_eng_raw
+  - models/datalake_eng_landing
+  - models/datalake_eng_sanitised
 seed-paths: ["seeds"]
 analysis-paths: ["analyses"]
-macro-paths: ["macros"]
-models:
-  materialized: 'table'
+macro-paths:
+  - macros/DATALAKE_MACROS
