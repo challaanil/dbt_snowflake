@@ -144,6 +144,8 @@ def lambda_handler(event, context):
         config_data = read_config_from_s3(bucket_name, s3_keys)
         processed_metadata = process_metadata(bucket_name, config_data)
 
+        timeout_threshold = context.get_remaining_time_in_millis() / 1000 - 10
+
         logger.info("Processing events...")
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {
@@ -153,6 +155,16 @@ def lambda_handler(event, context):
             for future in as_completed(futures):
                 try:
                     future.result()
+                    if time.time() - start_time.timestamp() > timeout_threshold:
+                        raise TimeoutError("Lambda function is about to timeout.")
+                except TimeoutError as te:
+                    logger.error(f"Timeout error: {te}")
+                    email_payload = {
+                        "email_recipients": ["admin@example.com"],
+                        "email_subject": "Lambda Timeout Warning",
+                        "email_body_html": "The Lambda function is about to timeout. Please investigate immediately."
+                    }
+                    send_email_notification(email_lambda_name, email_payload)
                 except Exception as e:
                     logger.error(f"Error in event processing: {e}")
 
