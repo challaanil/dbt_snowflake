@@ -126,7 +126,7 @@ def lambda_handler(event, context):
     try:
         logger.info("Reading configuration...")
         config_data = read_config_from_s3(bucket_name, s3_key)
-        email_recipients = config_data.get("email_recipients", [])
+        email_recipients = config_data.get("email_recipients", "").split(',')
 
         if not email_recipients:
             logger.warning("No email recipients specified in configuration.")
