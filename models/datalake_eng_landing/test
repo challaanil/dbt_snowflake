@@ -1,1 +1,780 @@
+import json
+import boto3
+import datetime
+import logging
+from botocore.exceptions import ClientError
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from zoneinfo import ZoneInfo
+
+# Setting logger
+msg_format = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+datetime_format = '%Y-%m-%d %H:%M:%S'
+logging.basicConfig(format=msg_format, datefmt=datetime_format)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def get_file_size(bucket_name, file_key):
+    try:
+        s3_filesize_client = boto3.client('s3')
+        response = s3_filesize_client.head_object(Bucket=bucket_name, Key=file_key)
+        file_size = response['ContentLength']
+        logger.info(f"Raw file size (bytes) : {file_size}")
+        file_size_mb = file_size/(1024*1024)  # File size in MB
+        logger.info(f"File size for {file_key}: {file_size_mb:.2f} MB")
+        return file_size_mb
+    except ClientError as e:
+        logger.error(f"Error retrieving size for {file_key} from bucket {bucket_name}: {e}")
+        return None
+
+def invoke_lambda_function(lambda_jobname, lambda_event):
+    try:
+        logger.info(f"Invoking Lambda function")
+        lambda_client = boto3.client('lambda')
+        response = lambda_client.invoke(
+            FunctionName=lambda_jobname,
+            InvocationType="Event",
+            Payload=json.dumps(lambda_event)
+        )
+        logger.info(f"Lambda function :  {lambda_jobname.split(':')[-1]} invoked successfully")
+    except Exception as e:
+        logger.error(f"Error invoking Lambda function: {e}")
+
+def invoke_glue_job(glue_jobname, glue_event):
+    try:
+        logger.info(f"Invoking Glue job")
+        glue_client = boto3.client('glue')
+        event_payload = json.dumps(glue_event)
+        response = glue_client.start_job_run(
+            JobName=glue_jobname,
+            Arguments={
+                '--lambda_event': event_payload
+            }
+        )
+        # Log Glue Job Run Id
+        job_run_id = response['JobRunId']
+        logger.info(f"Glue Job {glue_jobname} invoked successfully. JobRunID: {job_run_id}")
+    except Exception as e:
+        logger.error(f"Glue_invoke error code : {e}")
+
+def read_configfile_from_s3(bucket_name, s3_key):
+    file_config_details = {}
+    try:
+        s3_client = boto3.client('s3')
+        key_list = s3_key.split(",")
+        for key in key_list:
+            s3_configfile = key.strip()
+            s3_response = s3_client.get_object(Bucket=bucket_name, Key=s3_configfile)
+            file_content = s3_response['Body'].iter_lines()
+            json_data = [json.loads(line) for line in file_content if line]
+            file_config_details = {"parameter": json_data}
+            logger.info(f"Metadata loaded : {file_config_details}")
+    except Exception as e:
+        logger.error(f"Error in read configfile from s3: {e}")
+    return file_config_details
+
+def config_file_process(bucket_name, metadata):
+    metadata_check = []
+    files = []
+    folder_size = 0
+    try:
+        s3_client = boto3.client('s3')
+        for file_info in metadata.get("parameter", []):
+            s3_bucket = file_info.get("s3_bucket", "")
+            s3_path = file_info.get("s3_path", "").strip()  # Get the s3 path from metadata
+
+            if not s3_bucket or not s3_path:
+                metadata_check.append({
+                    "Key": s3_path,
+                    "Error": "Error",
+                    "Message": f"Invalid metadata entry: {file_info}"
+                })
+                continue
+            if s3_path.endswith("/"):
+                paginator = s3_client.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=bucket_name, Prefix=s3_path):
+                    for obj in page.get('Contents', []):
+                        s3_keys = obj['Key']
+                        files.append(s3_keys)
+                        files_size = get_file_size(bucket_name, s3_keys)  # calling filesize function
+                        logger.info(f"test filesize in function : {files_size}")
+                        if files_size is not None:
+                            folder_size += files_size
+                            logger.info(f"Test the folder size  : {folder_size}")
+                    file_info["filesize"] = folder_size
+            else:
+                files.append(s3_path)
+                file_size = get_file_size(bucket_name, s3_path)  # calling filesize function
+                if file_size is not None:
+                    file_info["filesize"] = file_size
+    except Exception as e:
+        logger.error(f"Error in config details: {e}")
+    return metadata
+
+def process_event(metadata_event, lambda_jobname, glue_jobname):
+    try:
+        filesize = int(metadata_event.get('filesize'))
+        if filesize < 50000:  # Files Size in MB's
+            lambda_event = {"parameter": [metadata_event]}
+            logger.info(f"Lambda_event : {lambda_event}")
+            invoke_lambda_function(lambda_jobname, lambda_event)
+        else:
+            glue_event = {"parameter": [metadata_event]}
+            logger.info(f"Glue_event: {glue_event}")
+            invoke_glue_job(glue_jobname, glue_event)
+    except Exception as e:
+        logger.error(f"Error processing metadata event : {e}")
+
+def generate_email_summary(email_recipients, email_subject, email_body):  # Prepare audit data
+    email_summary = {
+        "email_recipients": email_recipients,
+        "email_subject": email_subject,
+        "email_body_html": email_body
+    }
+    return email_summary
+
+def email_notification(email_lambda_jobname, email_payload):
+    email_lambda_client = boto3.client('lambda')
+    try:
+        logger.info("Email Lambda job invoke..........")
+        response = email_lambda_client.invoke(
+            FunctionName=email_lambda_jobname,
+            InvocationType="Event",
+            Payload=json.dumps(email_payload)
+        )
+        logger.info(f"Email Lambda job name :  {email_lambda_jobname.split(':')[-1]} invoked successfully")
+    except Exception as e:
+        logger.error(f"Email Lambda_invoke error code : {e}")
+
+def lambda_handler(event, context):
+    bucket_name = "tmk-cdm-landing"
+    s3_key = "tmk/gf_test/config/json_config/source_configfile/file_transfer_metadata.json"
+    lambda_jobname = "arn:aws:lambda:us-west-2:896172592430:function:gl-test-smb-file-transfer"
+    glue_jobname = "gl-acturial-file-transfer-test_v1"
+    email_jobname = "arn:aws:lambda:us-west-2:896172592430:function:smb-file-transfer_email_notification_test"
+    cst = ZoneInfo("America/Chicago")
+    start_time = datetime.datetime.now(cst)  # Define start time for timeout check
+    timeout_threshold = context.get_remaining_time_in_millis() / 1000 - 10
+    try:
+        logger.info("Reading config file from S3...")
+        config_metadata = read_configfile_from_s3(bucket_name, s3_key)
+        metadata_events = config_file_process(bucket_name, config_metadata)
+        logger.info("Processing events in parallel...")
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {}
+            for metadata_event in metadata_events['parameter']:
+                email_recipients = metadata_event.get("business_email_recipient", "").split(",")
+                futures[executor.submit(process_event, metadata_event, lambda_jobname, glue_jobname)] = email_recipients
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                    # Check for timeout
+                    if time.time() - start_time.timestamp() > timeout_threshold:
+                        raise TimeoutError("Lambda function is about to timeout.")
+                except Exception as e:
+                    logger.error(f"Error processing metadata event : {e}", exc_info=True)
+                    email_subject = "Actuarial S3 to SMB File Transfer Summary|Metadata processing Error"
+                    email_body = f"Failed to process metadata event : {str(e)}"
+                    lambda_event = generate_email_summary(futures[future], email_subject, email_body)
+                    logger.info(f"An error occurred during execution, email_notification invoked")
+                    email_notification(email_jobname, lambda_event)
+                    logger.info(f"email_send successfully")
+        return {
+            'statusCode': 200,
+            'body': json.dumps("Downstream job invoked Successfully.")
+        }
+    except TimeoutError as te:
+        logger.error(f"Timeout Error: {te}", exc_info=True)
+        email_subject = "Actuarial S3 to SMB File Transfer Summary | Timeout Error"
+        email_body = f"Your Lambda function is about to timeout."
+        lambda_event = generate_email_summary(futures[future], email_subject, email_body)
+        logger.info("Sending timeout error notification email")
+        email_notification(email_jobname, lambda_event)
+        logger.info("Timeout error email sent successfully")
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Timeout Error: {te}")
+        }
+    except Exception as e:
+        logger.error(f"Unexpected Error : {e}", exc_info=True)
+        email_subject = "Actuarial S3 to SMB File Transfer Summary|Unexpected Error"
+        email_body = f"An unexpected error occurred  : {str(e)}"
+        lambda_event = generate_email_summary(futures[future], email_subject, email_body)
+        logger.info(f"An error occurred during execution, email_notification invoked")
+        email_notification(email_jobname, lambda_event)
+        logger.info(f"email_send successfully")
+
+        # Return a custom error response
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Error Message: {e}")
+        }
+    finally:
+        logger.info('Lambda execution completed.')
+
+
+
+
+
+
+
+import boto3
+import json
+import smbclient
+import datetime
+from zoneinfo import ZoneInfo
+import socket
+import os
+import logging
+import time
+
+# Setting logger
+msg_format = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+datetime_format = '%Y-%m-%d %H:%M:%S'
+logging.basicConfig(format=msg_format, datefmt=datetime_format)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+job_name = "lambda_job"
+
+def get_credentials(secret_name):
+    secretsmanager_client = boto3.client('secretsmanager', region_name='us-west-2')
+    try:
+        logger.info(f"Fetching secret for :{secret_name}")
+        get_secret_value_response = secretsmanager_client.get_secret_value(SecretId=secret_name)
+        if 'SecretString' in get_secret_value_response:
+            secret = get_secret_value_response['SecretString']
+            secret_dict = json.loads(secret)
+            logger.info("Successfully fetched secret as string")
+            return secret_dict
+        else:
+            decoded_binary_secret = base64.b64decode(get_secret_value_response['SecretBinary'])
+            secret_dict = json.loads(decoded_binary_secret)
+            logger.info("Successfully fetched secret as binary.")
+            return secret_dict
+    except Exception as e:
+        logger.error(f"Error fetching secret: {e}", exc_info=True)
+        return None
+
+def configure_smb(smb_username, smb_password):
+    try:
+        if smb_username and smb_password:
+            smbclient.ClientConfig(username=smb_username, password=smb_password)
+            logger.info(f"SMB client configured successfully with username: {smb_username}")
+        else:
+            logger.error("SMB credentials are missing. Cannot configure SMB client.")
+    except Exception as e:
+        logger.error(f"Failed to configure SMB client: {e}", exc_info=True)
+
+def is_port_open(host, port):
+    try:
+        logger.info(f"Checking if port {port} on host {host} is open.")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(60)
+        result = sock.connect_ex((host, port))
+        if result == 0:
+            logger.info(f"Port {port} on host {host} is open")
+            return True
+        else:
+            logger.warning(f"Port {port} on host {host} is closed")
+            return False
+    except socket.error as e:
+        logger.error(f"Socket error while checking port {port} on host {host}: {e}", exc_info=True)
+        return False
+    finally:
+        sock.close()
+        logger.info("Socket connection closed")
+
+def create_smb_folder(smb_fileshare_path):
+    try:
+        if not smbclient.path.exists(f"{smb_fileshare_path}"):
+            smbclient.mkdir(f"{smb_fileshare_path}")
+            logger.info(f"Created SMB folder: {smb_fileshare_path}")
+        else:
+            logger.info(f"SMB folder already exists: {smb_fileshare_path}")
+    except Exception as e:
+        logger.error(f"Failed to create SMB folder: {smb_fileshare_path}. Error: {e}", exc_info=True)
+
+def file_with_timestamp(use_timestamp, files):
+    try:
+        if use_timestamp:
+            cst = ZoneInfo("America/Chicago")
+            timestamp = datetime.datetime.now(cst).strftime("%Y%m%d%H%M%S")
+            files_filename = files.split('/')[-1].split('.')
+            filename = files_filename[0] + str(timestamp) + '.' + files_filename[1]
+            logger.info(f"Generated file name with timestamp: {filename}")
+        else:
+            filename = files.split('/')[-1]
+            logger.info(f"Generated file name without timestamp: {filename}")
+        return filename
+    except Exception as e:
+        logger.error(f"Failed to generate file name. Error: {e}", exc_info=True)
+        return None
+
+def log_transfer_duration(start_time, end_time):
+    try:
+        duration = end_time - start_time
+        total_seconds = int(duration.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        load_duration = f"{hours}:{minutes}:{seconds}"
+        logger.info(f"Total duration for file transfer: {load_duration}")
+    except Exception as e:
+        logger.error(f"Failed to log transfer duration. Error: {e}", exc_info=True)
+    return load_duration
+
+def generate_audit_details(environment, source_system, batch_id_generation, smb_host, smb_port, bucket_name, s3_path, smb_fileshare_path, filename_with_timestamp, archival, archival_path, start_time, end_time, load_time_in_minutes, action, archive_key=None):
+    audit_details = {
+        "job_name": job_name,
+        "environment": environment,
+        "source_system": source_system,
+        "batch_id_generation": batch_id_generation,
+        "smb_host": smb_host,
+        "smb_port": smb_port,
+        "bucket_name": bucket_name,
+        "s3_path": s3_path,
+        "smb_fileshare_path": smb_fileshare_path,
+        "filename_with_timestamp": filename_with_timestamp,
+        "archival": archival,
+        "archival_path": archival_path,
+        "last_run_date": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "load_finish_date": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "load_time_in_minutes": load_time_in_minutes,
+        "action": action,
+        "archive_key": archive_key if action == "archived" else None,
+        "archived": "archived" if archival else "not archived",
+        "source_data_deleted": "deleted" if action == "deleted" else "not deleted"
+    }
+    return audit_details
+
+def transfer_file_to_smb(bucket_name, s3_key, smb_fileshare_path, filename_with_timestamp, chunk_size_mb, smb_host, smb_port, archival, archival_path, source_system, batch_id_generation, environment):
+    cst = ZoneInfo("America/Chicago")
+    start_time = datetime.datetime.now(cst)
+    logger.info(f"File Transfer started for {s3_key}.")
+    transferred_files = []
+    transfer_file_to_smb_s3_client = boto3.client('s3')
+    try:
+        s3_response = transfer_file_to_smb_s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+        file_stream = s3_response['Body']
+        file_size = s3_response['ContentLength']
+        max_size_mb = 50000 * 1024 * 1024
+        if file_size == 0 or file_size > max_size_mb:
+            msg = f"Skipping the file process where file size is: {file_size}."
+            logger.warning(msg)
+            return transferred_files, {}, msg
+        filename = file_with_timestamp(filename_with_timestamp, s3_key)
+        smb_file_path = f"{smb_fileshare_path}\\{filename}"
+        logger.info(f"SMB file path: {smb_file_path}")
+        chunk_size = chunk_size_mb * 1024 * 1024
+        with smbclient.open_file(smb_file_path, mode='w') as smb_file:
+            logger.info(f"Transferring {s3_key} to {smb_file_path} in chunks of {chunk_size_mb} MB.")
+            while True:
+                chunk = file_stream.read(chunk_size).decode('utf-8')
+                if not chunk:
+                    break
+                smb_file.write(chunk)
+                logger.debug(f"Writing chunk of size: {len(chunk)} bytes.")
+        transferred_files.append(s3_key)
+        end_time = datetime.datetime.now(cst)
+        logger.info(f"File transferred for {s3_key}.")
+        load_time_in_minutes = log_transfer_duration(start_time, end_time)
+        audit_details = generate_audit_details(environment, source_system, batch_id_generation, smb_host, smb_port, bucket_name, s3_key, smb_file_path, filename_with_timestamp, archival, archival_path, start_time, end_time, load_time_in_minutes, "transferred")
+        return transferred_files, audit_details, None
+    except Exception as e:
+        logger.error(f"Error in transferring file {s3_key}: {e}", exc_info=True)
+        return transferred_files, {}, str(e)
+
+def transfer_folder_to_smb(bucket_name, s3_folder, smb_fileshare_path, filename_with_timestamp, chunk_size_mb, smb_host, smb_port, archival, archival_path, source_system, batch_id_generation, environment):
+    transfer_folder_to_smb_s3_client = boto3.client('s3')
+    transferred_files = []
+    audit_details_list = []
+    failed_files = []
+    try:
+        logger.info(f"Starting transfer of s3 folder '{s3_folder}' to SMB path '{smb_fileshare_path}' .")
+        paginator = transfer_folder_to_smb_s3_client.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=s3_folder):
+            for obj in page.get('Contents', []):
+                s3_key = obj['Key']
+                if s3_key.endswith('/'):
+                    logger.info(f"Skipping folder: {s3_key}")
+                    continue
+                logger.info(f"Transferring file: {s3_key}")
+                files, audit_details, error = transfer_file_to_smb(bucket_name, s3_key, smb_fileshare_path, filename_with_timestamp, chunk_size_mb, smb_host, smb_port, archival, archival_path, source_system, batch_id_generation, environment)
+                transferred_files.extend(files)
+                if audit_details:
+                    audit_details_list.append(audit_details)
+                if error:
+                    failed_files.append((s3_key, error))
+        logger.info(f"Successfully transferred all files from S3 folder '{s3_folder}' to SMB path '{smb_fileshare_path}' .")
+    except Exception as e:
+        logger.error(f"An error occurred during folder transfer from S3 folder '{s3_folder}' to SMB: {e}", exc_info=True)
+        failed_files.append((s3_folder, str(e)))
+    return transferred_files, audit_details_list, failed_files
+
+def transfer_s3_to_smb(bucket_name, s3_path, smb_fileshare_path, filename_with_timestamp, chunk_size_mb, smb_host, smb_port, archival, archival_path, source_system, batch_id_generation, environment):
+    transferred_files = []
+    audit_details_list = []
+    failed_files = []
+    try:
+        if s3_path.endswith("/"):
+            logger.info(f"Handling folder transfer for S3 path: {s3_path}")
+            files, audits, failures = transfer_folder_to_smb(bucket_name, s3_path, smb_fileshare_path, filename_with_timestamp, chunk_size_mb, smb_host, smb_port, archival, archival_path, source_system, batch_id_generation, environment)
+        else:
+            logger.info(f"Handling file transfer for S3 key: {s3_path}")
+            files, audit_details, error = transfer_file_to_smb(bucket_name, s3_path, smb_fileshare_path, filename_with_timestamp, chunk_size_mb, smb_host, smb_port, archival, archival_path, source_system, batch_id_generation, environment)
+            audits = [audit_details] if audit_details else []
+            failures = [(s3_path, error)] if error else []
+        transferred_files.extend(files)
+        audit_details_list.extend(audits)
+        failed_files.extend(failures)
+        return transferred_files, audit_details_list, failed_files
+    except Exception as e:
+        logger.error(f"An error occurred during S3 to SMB transfer for path '{s3_path}': {e}", exc_info=True)
+        return transferred_files, audit_details_list, failed_files
+
+def delete_old_archives(use_retention, retention_period, bucket_name, archival_path, all_audit_details, source_system, batch_id_generation, environment):
+    logger.info(f"Deleting archiving process enabled.\nBucket: {bucket_name}\nFolder: {archival_path}")
+    if use_retention:
+        cst = ZoneInfo("America/Chicago")
+        delete_old_archives_s3_client = boto3.client('s3')
+        paginator = delete_old_archives_s3_client.get_paginator('list_objects_v2')
+        current_date = datetime.datetime.now(cst)
+        logger.info(f"Deleting archiving process current date: {current_date}")
+        try:
+            for page in paginator.paginate(Bucket=bucket_name, Prefix=archival_path, Delimiter='/'):
+                if 'CommonPrefixes' in page:
+                    for folder in page['CommonPrefixes']:
+                        folder_key = folder['Prefix']
+                        logger.info(f"Checking folder: {folder_key}")
+                        if '/' in folder_key:
+                            folder_timestamp = folder_key.strip("/").split("/")[-1]
+                            logger.info(f"Folder timestamp: {folder_timestamp}")
+                            try:
+                                folder_date = datetime.datetime.strptime(folder_timestamp, "%Y%m%d%H%M%S")
+                                logger.info(f"Folder date: {folder_date}")
+                                folder_age_days = (current_date - folder_date).days
+                                logger.info(f"Folder age in days: {folder_age_days}")
+                                if folder_age_days >= retention_period:
+                                    logger.info(f"Folder {folder_key} is {folder_age_days} days old. Older than retention_period {retention_period} days.")
+                                    delete_old_archives_s3_client.delete_object(Bucket=bucket_name, Key=folder_key)
+                                    logger.info(f"Deleted folder: {folder_key}")
+                                    end_time = datetime.datetime.now(cst)
+                                    load_time_in_minutes = log_transfer_duration(current_date, end_time)
+                                    delete_audit_details = generate_audit_details(environment, source_system, batch_id_generation, "", "", bucket_name, folder_key, "", "", "", current_date, end_time, load_time_in_minutes, "Archival folder deleted")
+                                    logger.info(f"Deleted files details: {delete_audit_details}")
+                                    all_audit_details.append(delete_audit_details)
+                            except ValueError as e:
+                                logger.warning(f"Invalid date format in folder name: {folder_key}. Error: {e}")
+                        else:
+                            logger.warning(f"Folder name does not contain valid timestamp: {folder_key}")
+        except Exception as e:
+            logger.error(f"Error while processing folders: {e}")
+    else:
+        logger.info(f"Deleting archiving folder is disabled. Skipping deletion...")
+
+def archive_files(use_archive, bucket_name, s3_key, archive_path, all_audit_details, source_system, batch_id_generation, environment):
+    try:
+        cst = ZoneInfo("America/Chicago")
+        start_time = datetime.datetime.now(cst)
+        logger.info(f"Archive batch generation: {batch_id_generation}")
+        if use_archive:
+            logger.info(f"Archiving enabled. Processing file: {s3_key}")
+            archive_files_s3_client = boto3.client('s3')
+            if s3_key.endswith("/"):
+                parent_folder = s3_key.split("/")[-2]
+            else:
+                parent_folder = s3_key.split("/")[-2]
+            archive_folder = os.path.join(os.path.join(archive_path, batch_id_generation), parent_folder)
+            logger.info(f"Archive folder: {archive_folder}")
+            archive_file_key = os.path.join(archive_folder, os.path.basename(s3_key))
+            archive_files_s3_client.copy_object(
+                Bucket=bucket_name,
+                CopySource={'Bucket': bucket_name, 'Key': s3_key},
+                Key=archive_file_key
+            )
+            logger.info(f"Archived {s3_key} to {archive_file_key}")
+            end_time = datetime.datetime.now(cst)
+            load_time_in_minutes = log_transfer_duration(start_time, end_time)
+            archival_audit_details = generate_audit_details(environment, source_system, batch_id_generation, "", "", bucket_name, s3_key, "", "", use_archive, archive_path, start_time, end_time, load_time_in_minutes, "archived", archive_file_key)
+            logger.info(f"Archived details: {archival_audit_details}")
+            all_audit_details.append(archival_audit_details)
+        else:
+            logger.info(f"Archiving is disabled. Skipping file archival.")
+    except Exception as e:
+        logger.error(f"Error archiving file {s3_key}. Error: {e}", exc_info=True)
+
+def delete_files(bucket_name, s3_key, all_audit_details, source_system, batch_id_generation, environment):
+    cst = ZoneInfo("America/Chicago")
+    start_time = datetime.datetime.now(cst)
+    try:
+        delete_files_s3_client = boto3.client('s3')
+        delete_files_s3_client.delete_object(Bucket=bucket_name, Key=s3_key)
+        logger.info(f"Deleted: {s3_key}")
+        end_time = datetime.datetime.now(cst)
+        load_time_in_minutes = log_transfer_duration(start_time, end_time)
+        delete_audit_details = generate_audit_details(environment, source_system, batch_id_generation, "", "", bucket_name, s3_key, "", "", "", start_time, end_time, load_time_in_minutes, "deleted")
+        logger.info(f"Deleted files details: {delete_audit_details}")
+        all_audit_details.append(delete_audit_details)
+    except Exception as e:
+        logger.error(f"Error deleting file {s3_key}: {e}")
+
+# Upload log files to S3
+def upload_to_s3(bucket_name, log_s3_path, data):
+    try:
+        cst = ZoneInfo("America/Chicago")
+        line_delimited_jsondata = "\n".join(json.dumps(record) for record in data)
+        s3_upload_client = boto3.client('s3')
+        current_time_stamp_folder = datetime.datetime.now(cst).strftime("%Y-%m-%d")
+        timestamp = datetime.datetime.now(cst).strftime("%Y%m%d%H%M%S")
+        file_name = f"audit_details_{timestamp}.json"
+        file_key = f"{log_s3_path}{current_time_stamp_folder}/{file_name}"
+        logger.info(f"Uploading audit details to S3 bucket: {bucket_name}, file: {file_key}")
+        s3_upload_client.put_object(Bucket=bucket_name, Key=file_key, Body=line_delimited_jsondata)
+        logger.info(f"Successfully uploaded audit details to {bucket_name}/{file_key}")
+    except Exception as e:
+        logger.error(f"Error uploading to S3: {e}", exc_info=True)
+
+
+def html_template(success_rows,failure_rows,batch_id_generation,environment):
+    email_subject = f"Actuarial S3 to SMB File Transfer Summary | {environment}"
+    email_body      = f"""<!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>File Transfer Report</title>
+                        <style>
+                            body {{
+                                font-family: Arial, sans-serif;
+                                margin: 20px;
+                                background-color: #f4f4f4;
+                            }}
+                            table {{
+                                width: 100%;
+                                border-collapse: collapse;
+                                margin-bottom: 20px;
+                            }}
+                            table, th, td {{
+                                border: 1px solid #ddd;
+                            }}
+                            th, td {{
+                                padding: 8px;
+                                text-align: left;
+                            }}
+                            th {{
+                                background-color: #4CAF50;
+                                color: white;
+                            }}
+                            tr:nth-child(even) {{
+                                background-color: #f2f2f2;
+                            }}
+                        </style>
+                    </head>
+                    <body>
+                        <h2>File Transfer Report | Batch id : {batch_id_generation}</h2>
+
+                    <p>    <h3>Successful Transfers</h3>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>s3_path</th>
+                                    <th>smb_fileshare_path</th>
+                                    <th>load_time_in_minutes</th>
+                                    <th>action</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {success_rows}
+                            </tbody>
+                        </table></p>
+
+                    <p>    <h3>Failed Transfers</h3>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>File Name</th>
+                                    <th>Error</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {failure_rows}
+                            </tbody>
+                        </table></p>
+
+                    <p>    <p>Thank you.</p>
+                    <p>    <p>Globe Life.</p>
+                    </body>
+                    </html>"""
+    return email_subject,email_body
+
+def generate_email_summary(email_recipients, email_subject, email_body):
+    email_summary = {
+        "email_recipients": email_recipients,
+        "email_subject": email_subject,
+        "email_body_html": email_body
+    }
+    return email_summary
+
+def email_notification(email_lambda_jobname, email_payload):
+    email_lambda_client = boto3.client('lambda')
+    try:
+        logger.info("Invoking Email Lambda job...")
+        response = email_lambda_client.invoke(
+            FunctionName=email_lambda_jobname,
+            InvocationType="Event",
+            Payload=json.dumps(email_payload)
+        )
+        logger.info(f"Email Lambda job '{email_lambda_jobname.split(':')[-1]}' invoked successfully.")
+    except Exception as e:
+        logger.error(f"Error invoking Email Lambda job: {e}")
+
+############################################################################################################################################################
+
+
+##########################################################################################################################################################
+def lambda_handler(event, context):
+    """
+    Main function to demonstrate the usage of all functionalities:
+    1. Fetch credentials from AWS Secrets Manager.
+    2. Perform SMB connectivity checks.
+    3. Transfer a file or folder from S3 to SMB.
+    4. Log the status of the process.
+    """
+    try:
+        cst = ZoneInfo("America/Chicago")
+        start_time = datetime.datetime.now(cst)
+        secret_name = os.getenv('secret_name')
+        chunk_size_mb = 5
+        batch_id_generation = datetime.datetime.now(cst).strftime("%Y%m%d%H%M%S%f")
+        logger.info("Starting the lambda function execution.")
+        # Set timeout threshold (e.g., 10 seconds before the actual Lambda timeout)
+        timeout_threshold = context.get_remaining_time_in_millis() / 1000 - 10
+
+        # Fetching the credentials from Secrets Manager
+        logger.info("Attempting to fetch credentials.")
+        credentials = get_credentials(secret_name)
+        if credentials:
+            logger.info("Fetched secret credentials successfully.")
+            username = credentials['username']
+            password = credentials['password']
+            logger.info(f"username : {username}")
+        else:
+            logger.error("Failed to fetch credentials. Exiting function.")
+            return {"statusCode": 500, "body": json.dumps("Failed to fetch credentials.")}
+
+        # Configuring SMB client
+        logger.info("Configuring SMB client.")
+        configure_smb(username, password)
+
+        logger.info(f"Received event details : {event}")
+        all_audit_details = []
+        overall_transferred_files = set()
+        overall_failed_files = set()
+        email_jobname = "arn:aws:lambda:us-west-2:896172592430:function:smb-file-transfer_email_notification_test"
+
+        for params in event['parameter']:
+            smb_host = params.get('smb_host', None)
+            smb_port = params.get('smb_port', None)
+            bucket_name = params.get('s3_bucket', None)
+            s3_path = params.get('s3_path', None)
+            smb_fileshare_path = params.get('smb_fileshare_path', None)
+            filename_with_timestamp = params.get('filename_with_timestamp', None)
+            archival = params.get('archival', None)
+            archival_path = params.get('archival_path', None)
+            log_s3_bucket = params.get("log_s3_bucket", None)
+            log_s3_path = params.get('log_s3_path', None)
+            email_recipients = params.get("business_email_recipient", None).split(",")
+            source_system = params.get("source_system", None)
+            environment = params.get("environment", None)
+            use_retention = params.get("use_retention", None)
+            retention_period = params.get("retention_period", None)
+
+            if not is_port_open(smb_host, smb_port):
+                msg = f"Port {smb_port} on {smb_host} is closed. Skipping"
+                logger.error(msg)
+                overall_failed_files.add((s3_path, msg))
+                continue
+
+            logger.info(f"Initiating file transfer from S3 to SMB.")
+            transferred_files, audit_details_list, failed_files = transfer_s3_to_smb(
+                bucket_name, s3_path, smb_fileshare_path, filename_with_timestamp,
+                chunk_size_mb, smb_host, smb_port, archival, archival_path,
+                source_system, batch_id_generation, environment
+            )
+            overall_transferred_files.update(transferred_files)
+            overall_failed_files.update(failed_files)
+            all_audit_details.extend(audit_details_list)
+            
+            if archival:
+                for file in transferred_files:
+                    archive_files(archival, bucket_name, file, archival_path, all_audit_details, source_system, batch_id_generation, environment)
+                    #logger.info(f"Archived file: {file} to {archival_path}")
+            # Check for timeout
+            if time.time() - start_time.timestamp() > timeout_threshold:
+                raise TimeoutError("Lambda function is about to timeout.")
+
+        upload_to_s3(log_s3_bucket, log_s3_path, all_audit_details)
+        logger.info(f"all_audit_details : {all_audit_details}")
+        
+        success_rows = ""
+        overall_transferred_files = [file for file in all_audit_details if file.get("action") == 'transferred']
+        if overall_transferred_files:
+            for count, file in enumerate(overall_transferred_files, start=1):
+                success_rows += f"<tr><td>{count}</td><td>{file['s3_path']}</td><td>{file['smb_fileshare_path']}</td><td>{file['load_time_in_minutes']}</td><td>{file['action']}</td></tr>"
+        else:
+            success_rows = "<tr><td colspan='5'>No files transferred successfully.</td></tr>"
+
+        failure_rows = ""
+        if overall_failed_files:
+            for count, (failed_file, error) in enumerate(overall_failed_files, start=1):
+                failure_rows += f"<tr><td>{count}</td><td>{failed_file}</td><td>{error}</td></tr>"
+        else:
+            failure_rows = "<tr><td colspan='3'>No failed files.</td></tr>"
+
+        email_subject, email_body = html_template(success_rows, failure_rows, batch_id_generation, environment)
+        lambda_event = generate_email_summary(email_recipients, email_subject, email_body)
+        logger.info("Sending an email")
+        email_notification(email_jobname, lambda_event)
+        logger.info("Email sent successfully")
+
+        end_time = datetime.datetime.now(cst)
+        load_time_in_minutes = log_transfer_duration(start_time, end_time)
+        logger.info(f"Total duration for file processing: {load_time_in_minutes}")
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps("Job executed successfully.")
+        }
+
+    except TimeoutError as te:
+        logger.error(f"Timeout Error: {te}", exc_info=True)
+        email_subject = "Actuarial S3 to SMB File Transfer Summary | Timeout Error"
+        email_body = f"Your Lambda function is about to timeout."
+        lambda_event = generate_email_summary(email_recipients, email_subject, email_body)
+        logger.info("Sending timeout error notification email")
+        email_notification(email_jobname, lambda_event)
+        logger.info("Timeout error email sent successfully")
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Timeout Error: {te}")
+        }
+    except Exception as e:
+        logger.error(f"An error occurred in the lambda handler: {e}", exc_info=True)
+        email_subject = "Actuarial S3 to SMB File Transfer Summary | S3 Transfer Error"
+        email_body = f"An error occurred during file transfer: {str(e)}"
+        lambda_event = generate_email_summary(email_recipients, email_subject, email_body)
+        logger.info("An error occurred during execution, email notification invoked")
+        email_notification(email_jobname, lambda_event)
+        logger.info("Email sent successfully")
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Error Message: {e}")
+        }
+
+    finally:
+        logger.info('Lambda execution completed.')
+    
+
 
