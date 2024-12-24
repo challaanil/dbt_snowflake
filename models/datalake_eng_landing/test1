@@ -1,1 +1,171 @@
+import boto3
+import datetime
+import logging
+import json
+import time
+from botocore.exceptions import ClientError
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from zoneinfo import ZoneInfo
 
+# Logger configuration
+LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
+logging.basicConfig(format=LOG_FORMAT, datefmt=DATE_FORMAT)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+def get_file_size(bucket_name, file_key):
+    """Retrieve the size of a file in an S3 bucket."""
+    try:
+        s3_client = boto3.client('s3')
+        response = s3_client.head_object(Bucket=bucket_name, Key=file_key)
+        file_size = response['ContentLength'] / (1024 * 1024)  # Convert bytes to MB
+        logger.info(f"File size for {file_key}: {file_size:.2f} MB")
+        return file_size
+    except ClientError as e:
+        logger.error(f"Error retrieving size for {file_key} from bucket {bucket_name}: {e}")
+        return None
+
+def invoke_lambda(lambda_name, event_payload):
+    """Invoke an AWS Lambda function."""
+    try:
+        logger.info(f"Invoking Lambda function: {lambda_name}")
+        lambda_client = boto3.client('lambda')
+        lambda_client.invoke(
+            FunctionName=lambda_name,
+            InvocationType="Event",
+            Payload=json.dumps(event_payload)
+        )
+        logger.info(f"Lambda function {lambda_name.split(':')[-1]} invoked successfully.")
+    except Exception as e:
+        logger.error(f"Error invoking Lambda function {lambda_name}: {e}")
+
+def invoke_glue_job(job_name, event_payload):
+    """Invoke an AWS Glue job."""
+    try:
+        logger.info(f"Invoking Glue job: {job_name}")
+        glue_client = boto3.client('glue')
+        response = glue_client.start_job_run(
+            JobName=job_name,
+            Arguments={"--lambda_event": json.dumps(event_payload)}
+        )
+        job_run_id = response['JobRunId']
+        logger.info(f"Glue Job {job_name} invoked successfully. JobRunID: {job_run_id}")
+    except Exception as e:
+        logger.error(f"Error invoking Glue job {job_name}: {e}")
+
+def read_config_from_s3(bucket_name, config_keys):
+    """Read configuration files from S3."""
+    try:
+        s3_client = boto3.client('s3')
+        config_data = []
+        for key in config_keys:
+            response = s3_client.get_object(Bucket=bucket_name, Key=key.strip())
+            file_content = response['Body'].iter_lines()
+            config_data.extend(json.loads(line) for line in file_content if line)
+        logger.info(f"Loaded configuration from S3: {config_data}")
+        return {"parameter": config_data}
+    except Exception as e:
+        logger.error(f"Error reading configuration from S3: {e}")
+        return {"parameter": []}
+
+def process_metadata(bucket_name, metadata):
+    """Process metadata to compute folder and file sizes."""
+    processed_metadata = []
+    try:
+        s3_client = boto3.client('s3')
+        for entry in metadata.get("parameter", []):
+            s3_bucket = entry.get("s3_bucket", bucket_name)
+            s3_path = entry.get("s3_path", "").strip()
+
+            if not s3_path:
+                logger.warning(f"Invalid metadata entry: {entry}")
+                continue
+
+            folder_size = 0
+            files = []
+
+            if s3_path.endswith("/"):
+                paginator = s3_client.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=s3_bucket, Prefix=s3_path):
+                    for obj in page.get('Contents', []):
+                        file_key = obj['Key']
+                        files.append(file_key)
+                        file_size = get_file_size(s3_bucket, file_key)
+                        if file_size is not None:
+                            folder_size += file_size
+                entry["filesize"] = folder_size
+            else:
+                files.append(s3_path)
+                file_size = get_file_size(s3_bucket, s3_path)
+                entry["filesize"] = file_size
+
+            processed_metadata.append(entry)
+    except Exception as e:
+        logger.error(f"Error processing metadata: {e}")
+    return {"parameter": processed_metadata}
+
+def process_event(metadata_event, lambda_name, glue_job_name):
+    """Process individual metadata events."""
+    try:
+        file_size = int(metadata_event.get('filesize', 0))
+        if file_size < 50_000:  # Threshold size in MB
+            invoke_lambda(lambda_name, {"parameter": [metadata_event]})
+        else:
+            invoke_glue_job(glue_job_name, {"parameter": [metadata_event]})
+    except Exception as e:
+        logger.error(f"Error processing metadata event: {e}")
+
+def send_email_notification(email_lambda_name, email_payload):
+    """Send an email notification using a Lambda function."""
+    try:
+        logger.info("Sending email notification...")
+        lambda_client = boto3.client('lambda')
+        lambda_client.invoke(
+            FunctionName=email_lambda_name,
+            InvocationType="Event",
+            Payload=json.dumps(email_payload)
+        )
+        logger.info(f"Email notification sent via {email_lambda_name}.")
+    except Exception as e:
+        logger.error(f"Error sending email notification: {e}")
+
+def lambda_handler(event, context):
+    """AWS Lambda entry point."""
+    bucket_name = "tmk-cdm-landing"
+    s3_keys = ["tmk/gf_test/config/json_config/source_configfile/file_transfer_metadata.json"]
+    lambda_name = "arn:aws:lambda:us-west-2:896172592430:function:gl-test-smb-file-transfer"
+    glue_job_name = "gl-acturial-file-transfer-test_v1"
+    email_lambda_name = "arn:aws:lambda:us-west-2:896172592430:function:smb-file-transfer_email_notification_test"
+    start_time = datetime.datetime.now(ZoneInfo("America/Chicago"))
+
+    try:
+        logger.info("Reading configuration files...")
+        config_data = read_config_from_s3(bucket_name, s3_keys)
+        processed_metadata = process_metadata(bucket_name, config_data)
+
+        logger.info("Processing events...")
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(process_event, event, lambda_name, glue_job_name): event
+                for event in processed_metadata.get("parameter", [])
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in event processing: {e}")
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps("Processing completed successfully.")
+        }
+
+    except Exception as e:
+        logger.error(f"Unhandled error: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Error occurred: {e}")
+        }
+    finally:
+        logger.info("Lambda function execution completed.")
