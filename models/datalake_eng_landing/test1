@@ -1,13 +1,13 @@
+import json
 import boto3
 import datetime
 import logging
-import json
-import time
 from botocore.exceptions import ClientError
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from zoneinfo import ZoneInfo
 
-# Logger configuration
+# Setting logger
 LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
 DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 logging.basicConfig(format=LOG_FORMAT, datefmt=DATE_FORMAT)
@@ -15,110 +15,95 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 def get_file_size(bucket_name, file_key):
-    """Retrieve the size of a file in an S3 bucket."""
+    """Retrieve the file size from S3."""
     try:
         s3_client = boto3.client('s3')
         response = s3_client.head_object(Bucket=bucket_name, Key=file_key)
-        file_size = response['ContentLength'] / (1024 * 1024)  # Convert bytes to MB
+        file_size = response['ContentLength'] / (1024 * 1024)  # Convert to MB
         logger.info(f"File size for {file_key}: {file_size:.2f} MB")
         return file_size
     except ClientError as e:
-        logger.error(f"Error retrieving size for {file_key} from bucket {bucket_name}: {e}")
+        logger.error(f"Error retrieving size for {file_key}: {e}")
         return None
 
-def invoke_lambda(lambda_name, event_payload):
+def invoke_lambda_function(lambda_jobname, lambda_event):
     """Invoke an AWS Lambda function."""
     try:
-        logger.info(f"Invoking Lambda function: {lambda_name}")
+        logger.info(f"Invoking Lambda function: {lambda_jobname}")
         lambda_client = boto3.client('lambda')
         lambda_client.invoke(
-            FunctionName=lambda_name,
+            FunctionName=lambda_jobname,
             InvocationType="Event",
-            Payload=json.dumps(event_payload)
+            Payload=json.dumps(lambda_event)
         )
-        logger.info(f"Lambda function {lambda_name.split(':')[-1]} invoked successfully.")
+        logger.info(f"Lambda function {lambda_jobname.split(':')[-1]} invoked successfully.")
     except Exception as e:
-        logger.error(f"Error invoking Lambda function {lambda_name}: {e}")
+        logger.error(f"Error invoking Lambda function {lambda_jobname}: {e}")
 
-def invoke_glue_job(job_name, event_payload):
+def invoke_glue_job(glue_jobname, glue_event):
     """Invoke an AWS Glue job."""
     try:
-        logger.info(f"Invoking Glue job: {job_name}")
+        logger.info(f"Invoking Glue job: {glue_jobname}")
         glue_client = boto3.client('glue')
         response = glue_client.start_job_run(
-            JobName=job_name,
-            Arguments={"--lambda_event": json.dumps(event_payload)}
+            JobName=glue_jobname,
+            Arguments={"--lambda_event": json.dumps(glue_event)}
         )
-        job_run_id = response['JobRunId']
-        logger.info(f"Glue Job {job_name} invoked successfully. JobRunID: {job_run_id}")
+        logger.info(f"Glue Job {glue_jobname} invoked successfully with JobRunID: {response['JobRunId']}")
     except Exception as e:
-        logger.error(f"Error invoking Glue job {job_name}: {e}")
+        logger.error(f"Error invoking Glue job {glue_jobname}: {e}")
 
-def read_config_from_s3(bucket_name, config_keys):
-    """Read configuration files from S3."""
+def read_config_from_s3(bucket_name, s3_key):
+    """Read configuration file from S3."""
     try:
         s3_client = boto3.client('s3')
-        config_data = []
-        for key in config_keys:
-            response = s3_client.get_object(Bucket=bucket_name, Key=key.strip())
-            file_content = response['Body'].iter_lines()
-            config_data.extend(json.loads(line) for line in file_content if line)
-        logger.info(f"Loaded configuration from S3: {config_data}")
-        return {"parameter": config_data}
+        response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+        file_content = response['Body'].read().decode('utf-8')
+        config_data = json.loads(file_content)
+        logger.info(f"Configuration data loaded: {config_data}")
+        return config_data
     except Exception as e:
         logger.error(f"Error reading configuration from S3: {e}")
-        return {"parameter": []}
+        return {}
 
-def process_metadata(bucket_name, metadata):
-    """Process metadata to compute folder and file sizes."""
-    processed_metadata = []
+def process_metadata(metadata, bucket_name):
+    """Process metadata entries to calculate file sizes."""
     try:
         s3_client = boto3.client('s3')
-        for entry in metadata.get("parameter", []):
-            s3_bucket = entry.get("s3_bucket", bucket_name)
-            s3_path = entry.get("s3_path", "").strip()
-
+        for entry in metadata:
+            s3_path = entry.get("s3_path")
             if not s3_path:
-                logger.warning(f"Invalid metadata entry: {entry}")
+                logger.warning(f"Missing s3_path in metadata entry: {entry}")
                 continue
-
-            folder_size = 0
-            files = []
 
             if s3_path.endswith("/"):
                 paginator = s3_client.get_paginator('list_objects_v2')
-                for page in paginator.paginate(Bucket=s3_bucket, Prefix=s3_path):
+                folder_size = 0
+                for page in paginator.paginate(Bucket=bucket_name, Prefix=s3_path):
                     for obj in page.get('Contents', []):
                         file_key = obj['Key']
-                        files.append(file_key)
-                        file_size = get_file_size(s3_bucket, file_key)
-                        if file_size is not None:
+                        file_size = get_file_size(bucket_name, file_key)
+                        if file_size:
                             folder_size += file_size
                 entry["filesize"] = folder_size
             else:
-                files.append(s3_path)
-                file_size = get_file_size(s3_bucket, s3_path)
+                file_size = get_file_size(bucket_name, s3_path)
                 entry["filesize"] = file_size
 
-            processed_metadata.append(entry)
+        logger.info("Metadata processing complete.")
+        return metadata
     except Exception as e:
         logger.error(f"Error processing metadata: {e}")
-    return {"parameter": processed_metadata}
+        return metadata
 
-def process_event(metadata_event, lambda_name, glue_job_name):
-    """Process individual metadata events."""
-    try:
-        file_size = int(metadata_event.get('filesize', 0))
-        if file_size < 50_000:  # Threshold size in MB
-            invoke_lambda(lambda_name, {"parameter": [metadata_event]})
-        else:
-            invoke_glue_job(glue_job_name, {"parameter": [metadata_event]})
-    except Exception as e:
-        logger.error(f"Error processing metadata event: {e}")
-
-def send_email_notification(email_lambda_name, email_payload):
+def send_email_notification(email_lambda_name, email_recipients, subject, body):
     """Send an email notification using a Lambda function."""
     try:
+        email_payload = {
+            "email_recipients": email_recipients,
+            "email_subject": subject,
+            "email_body_html": body
+        }
         logger.info("Sending email notification...")
         lambda_client = boto3.client('lambda')
         lambda_client.invoke(
@@ -131,53 +116,61 @@ def send_email_notification(email_lambda_name, email_payload):
         logger.error(f"Error sending email notification: {e}")
 
 def lambda_handler(event, context):
-    """AWS Lambda entry point."""
+    """Main Lambda handler."""
     bucket_name = "tmk-cdm-landing"
-    s3_keys = ["tmk/gf_test/config/json_config/source_configfile/file_transfer_metadata.json"]
-    lambda_name = "arn:aws:lambda:us-west-2:896172592430:function:gl-test-smb-file-transfer"
-    glue_job_name = "gl-acturial-file-transfer-test_v1"
+    s3_key = "tmk/gf_test/config/json_config/source_configfile/file_transfer_metadata.json"
+    lambda_jobname = "arn:aws:lambda:us-west-2:896172592430:function:gl-test-smb-file-transfer"
+    glue_jobname = "gl-acturial-file-transfer-test_v1"
     email_lambda_name = "arn:aws:lambda:us-west-2:896172592430:function:smb-file-transfer_email_notification_test"
-    start_time = datetime.datetime.now(ZoneInfo("America/Chicago"))
 
     try:
-        logger.info("Reading configuration files...")
-        config_data = read_config_from_s3(bucket_name, s3_keys)
-        processed_metadata = process_metadata(bucket_name, config_data)
+        logger.info("Reading configuration...")
+        config_data = read_config_from_s3(bucket_name, s3_key)
+        email_recipients = config_data.get("email_recipients", [])
+
+        if not email_recipients:
+            logger.warning("No email recipients specified in configuration.")
+
+        metadata = process_metadata(config_data.get("parameter", []), bucket_name)
 
         timeout_threshold = context.get_remaining_time_in_millis() / 1000 - 10
 
-        logger.info("Processing events...")
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {
-                executor.submit(process_event, event, lambda_name, glue_job_name): event
-                for event in processed_metadata.get("parameter", [])
+                executor.submit(process_event, event, lambda_jobname, glue_jobname): event
+                for event in metadata
             }
+
             for future in as_completed(futures):
                 try:
                     future.result()
-                    if time.time() - start_time.timestamp() > timeout_threshold:
-                        raise TimeoutError("Lambda function is about to timeout.")
+                    if time.time() > timeout_threshold:
+                        raise TimeoutError("Lambda function is nearing timeout.")
                 except TimeoutError as te:
-                    logger.error(f"Timeout error: {te}")
-                    email_payload = {
-                        "email_recipients": ["admin@example.com"],
-                        "email_subject": "Lambda Timeout Warning",
-                        "email_body_html": "The Lambda function is about to timeout. Please investigate immediately."
-                    }
-                    send_email_notification(email_lambda_name, email_payload)
+                    logger.error("Timeout error detected.")
+                    send_email_notification(
+                        email_lambda_name,
+                        email_recipients,
+                        "Lambda Timeout Alert",
+                        "The Lambda function is about to timeout. Please review the logs and investigate."
+                    )
                 except Exception as e:
-                    logger.error(f"Error in event processing: {e}")
+                    logger.error(f"Error processing event: {e}")
 
         return {
             'statusCode': 200,
-            'body': json.dumps("Processing completed successfully.")
+            'body': json.dumps("Processing complete.")
         }
 
     except Exception as e:
-        logger.error(f"Unhandled error: {e}")
+        logger.error(f"Unexpected error: {e}")
+        send_email_notification(
+            email_lambda_name,
+            email_recipients,
+            "Lambda Execution Error",
+            f"An error occurred during Lambda execution: {str(e)}"
+        )
         return {
             'statusCode': 500,
-            'body': json.dumps(f"Error occurred: {e}")
+            'body': json.dumps(f"Error: {str(e)}")
         }
-    finally:
-        logger.info("Lambda function execution completed.")
