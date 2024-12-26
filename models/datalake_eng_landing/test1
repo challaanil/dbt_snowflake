@@ -1,176 +1,163 @@
-import json
 import boto3
+import json
+import smbclient
 import datetime
-import logging
-from botocore.exceptions import ClientError
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 from zoneinfo import ZoneInfo
+import socket
+import os
+import logging
+import time
 
 # Setting logger
-LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
-DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
-logging.basicConfig(format=LOG_FORMAT, datefmt=DATE_FORMAT)
-logger = logging.getLogger(__name__)
+msg_format = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+datetime_format = '%Y-%m-%d %H:%M:%S'
+logging.basicConfig(format=msg_format, datefmt=datetime_format)
+logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-def get_file_size(bucket_name, file_key):
-    """Retrieve the file size from S3."""
+job_name = "lambda_job"
+
+def get_credentials(secret_name):
+    secretsmanager_client = boto3.client('secretsmanager', region_name='us-west-2')
     try:
-        s3_client = boto3.client('s3')
-        response = s3_client.head_object(Bucket=bucket_name, Key=file_key)
-        file_size = response['ContentLength'] / (1024 * 1024)  # Convert to MB
-        logger.info(f"File size for {file_key}: {file_size:.2f} MB")
-        return file_size
-    except ClientError as e:
-        logger.error(f"Error retrieving size for {file_key}: {e}")
+        logger.info(f"Fetching secret for :{secret_name}")
+        get_secret_value_response = secretsmanager_client.get_secret_value(SecretId=secret_name)
+        if 'SecretString' in get_secret_value_response:
+            secret = get_secret_value_response['SecretString']
+            secret_dict = json.loads(secret)
+            logger.info("Successfully fetched secret as string")
+            return secret_dict
+        else:
+            decoded_binary_secret = base64.b64decode(get_secret_value_response['SecretBinary'])
+            secret_dict = json.loads(decoded_binary_secret)
+            logger.info("Successfully fetched secret as binary.")
+            return secret_dict
+    except Exception as e:
+        logger.error(f"Error fetching secret: {e}", exc_info=True)
         return None
 
-def invoke_lambda_function(lambda_jobname, lambda_event):
-    """Invoke an AWS Lambda function."""
+def configure_smb(smb_username, smb_password):
     try:
-        logger.info(f"Invoking Lambda function: {lambda_jobname}")
-        lambda_client = boto3.client('lambda')
-        lambda_client.invoke(
-            FunctionName=lambda_jobname,
-            InvocationType="Event",
-            Payload=json.dumps(lambda_event)
-        )
-        logger.info(f"Lambda function {lambda_jobname.split(':')[-1]} invoked successfully.")
+        if smb_username and smb_password:
+            smbclient.ClientConfig(username=smb_username, password=smb_password)
+            logger.info(f"SMB client configured successfully with username: {smb_username}")
+        else:
+            logger.error("SMB credentials are missing. Cannot configure SMB client.")
     except Exception as e:
-        logger.error(f"Error invoking Lambda function {lambda_jobname}: {e}")
+        logger.error(f"Failed to configure SMB client: {e}", exc_info=True)
 
-def invoke_glue_job(glue_jobname, glue_event):
-    """Invoke an AWS Glue job."""
+def is_port_open(host, port):
     try:
-        logger.info(f"Invoking Glue job: {glue_jobname}")
-        glue_client = boto3.client('glue')
-        response = glue_client.start_job_run(
-            JobName=glue_jobname,
-            Arguments={"--lambda_event": json.dumps(glue_event)}
-        )
-        logger.info(f"Glue Job {glue_jobname} invoked successfully with JobRunID: {response['JobRunId']}")
+        logger.info(f"Checking if port {port} on host {host} is open.")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(60)
+        result = sock.connect_ex((host, port))
+        if result == 0:
+            logger.info(f"Port {port} on host {host} is open")
+            return True
+        else:
+            logger.warning(f"Port {port} on host {host} is closed")
+            return False
+    except socket.error as e:
+        logger.error(f"Socket error while checking port {port} on host {host}: {e}", exc_info=True)
+        return False
+    finally:
+        sock.close()
+        logger.info("Socket connection closed")
+
+def file_with_timestamp(use_timestamp, file_path):
+    try:
+        if use_timestamp:
+            cst = ZoneInfo("America/Chicago")
+            timestamp = datetime.datetime.now(cst).strftime("%Y%m%d%H%M%S")
+            filename, file_ext = os.path.splitext(os.path.basename(file_path))
+            filename_with_timestamp = f"{filename}_{timestamp}{file_ext}"
+            logger.info(f"Generated file name with timestamp: {filename_with_timestamp}")
+        else:
+            filename_with_timestamp = os.path.basename(file_path)
+            logger.info(f"Generated file name without timestamp: {filename_with_timestamp}")
+        return filename_with_timestamp
     except Exception as e:
-        logger.error(f"Error invoking Glue job {glue_jobname}: {e}")
+        logger.error(f"Failed to generate file name. Error: {e}", exc_info=True)
+        return None
 
-def read_config_from_s3(bucket_name, s3_key):
-    """Read configuration file from S3."""
+def matches_filters(file_key, prefixes=None, extensions=None):
     try:
+        if prefixes:
+            prefix_match = any(file_key.startswith(prefix) for prefix in prefixes)
+        else:
+            prefix_match = True
+
+        if extensions:
+            extension_match = any(file_key.endswith(ext) for ext in extensions)
+        else:
+            extension_match = True
+
+        return prefix_match and extension_match
+    except Exception as e:
+        logger.error(f"Error matching filters for file {file_key}: {e}", exc_info=True)
+        return False
+
+def transfer_file_to_smb(bucket_name, s3_key, smb_path, use_timestamp, chunk_size_mb, prefixes=None, extensions=None):
+    try:
+        if not matches_filters(s3_key, prefixes, extensions):
+            logger.info(f"File {s3_key} does not match the filters. Skipping.")
+       ll     return False
+
         s3_client = boto3.client('s3')
+        logger.info(f"Starting file transfer: S3 {s3_key} to SMB {smb_path}")
+
+        # Get file from S3
         response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
-        file_content = response['Body'].read().decode('utf-8')
-        config_data = json.loads(file_content)
-        logger.info(f"Configuration data loaded: {config_data}")
-        return config_data
+        file_stream = response['Body']
+        file_size = response['ContentLength']
+
+        # Generate timestamped file name if required
+        filename = file_with_timestamp(use_timestamp, s3_key)
+        smb_file_path = os.path.join(smb_path, filename)
+
+        # Write to SMB
+        chunk_size = chunk_size_mb * 1024 * 1024
+        with smbclient.open_file(smb_file_path, mode='w') as smb_file:
+            logger.info(f"Writing to SMB in chunks of {chunk_size_mb} MB.")
+            while chunk := file_stream.read(chunk_size):
+                smb_file.write(chunk)
+
+        logger.info(f"File {s3_key} transferred to {smb_file_path} successfully.")
+        return True
     except Exception as e:
-        logger.error(f"Error reading configuration from S3: {e}")
-        return {}
-
-def process_metadata(metadata, bucket_name):
-    """Process metadata entries to calculate file sizes."""
-    try:
-        s3_client = boto3.client('s3')
-        for entry in metadata:
-            s3_path = entry.get("s3_path")
-            if not s3_path:
-                logger.warning(f"Missing s3_path in metadata entry: {entry}")
-                continue
-
-            if s3_path.endswith("/"):
-                paginator = s3_client.get_paginator('list_objects_v2')
-                folder_size = 0
-                for page in paginator.paginate(Bucket=bucket_name, Prefix=s3_path):
-                    for obj in page.get('Contents', []):
-                        file_key = obj['Key']
-                        file_size = get_file_size(bucket_name, file_key)
-                        if file_size:
-                            folder_size += file_size
-                entry["filesize"] = folder_size
-            else:
-                file_size = get_file_size(bucket_name, s3_path)
-                entry["filesize"] = file_size
-
-        logger.info("Metadata processing complete.")
-        return metadata
-    except Exception as e:
-        logger.error(f"Error processing metadata: {e}")
-        return metadata
-
-def send_email_notification(email_lambda_name, email_recipients, subject, body):
-    """Send an email notification using a Lambda function."""
-    try:
-        email_payload = {
-            "email_recipients": email_recipients,
-            "email_subject": subject,
-            "email_body_html": body
-        }
-        logger.info("Sending email notification...")
-        lambda_client = boto3.client('lambda')
-        lambda_client.invoke(
-            FunctionName=email_lambda_name,
-            InvocationType="Event",
-            Payload=json.dumps(email_payload)
-        )
-        logger.info(f"Email notification sent via {email_lambda_name}.")
-    except Exception as e:
-        logger.error(f"Error sending email notification: {e}")
+        logger.error(f"Failed to transfer file {s3_key} to SMB. Error: {e}", exc_info=True)
+        return False
 
 def lambda_handler(event, context):
-    """Main Lambda handler."""
-    bucket_name = "tmk-cdm-landing"
-    s3_key = "tmk/gf_test/config/json_config/source_configfile/file_transfer_metadata.json"
-    lambda_jobname = "arn:aws:lambda:us-west-2:896172592430:function:gl-test-smb-file-transfer"
-    glue_jobname = "gl-acturial-file-transfer-test_v1"
-    email_lambda_name = "arn:aws:lambda:us-west-2:896172592430:function:smb-file-transfer_email_notification_test"
-
     try:
-        logger.info("Reading configuration...")
-        config_data = read_config_from_s3(bucket_name, s3_key)
-        email_recipients = config_data.get("email_recipients", "").split(',')
+        logger.info("Lambda function execution started.")
+        secret_name = os.getenv('secret_name')
+        credentials = get_credentials(secret_name)
 
-        if not email_recipients:
-            logger.warning("No email recipients specified in configuration.")
+        if not credentials:
+            return {"statusCode": 500, "body": "Failed to fetch credentials."}
 
-        metadata = process_metadata(config_data.get("parameter", []), bucket_name)
+        configure_smb(credentials['username'], credentials['password'])
 
-        timeout_threshold = context.get_remaining_time_in_millis() / 1000 - 10
+        bucket_name = event['bucket_name']
+        s3_prefixes = event.get('s3_prefixes', "").split(',')
+        s3_extensions = event.get('s3_extensions', "").split(',')
+        smb_path = event['smb_path']
+        use_timestamp = event.get('use_timestamp', True)
+        chunk_size_mb = event.get('chunk_size_mb', 5)
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {
-                executor.submit(process_event, event, lambda_jobname, glue_jobname): event
-                for event in metadata
-            }
+        s3_client = boto3.client('s3')
+        paginator = s3_client.get_paginator('list_objects_v2')
 
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                    if time.time() > timeout_threshold:
-                        raise TimeoutError("Lambda function is nearing timeout.")
-                except TimeoutError as te:
-                    logger.error("Timeout error detected.")
-                    send_email_notification(
-                        email_lambda_name,
-                        email_recipients,
-                        "Lambda Timeout Alert",
-                        "The Lambda function is about to timeout. Please review the logs and investigate."
-                    )
-                except Exception as e:
-                    logger.error(f"Error processing event: {e}")
+        for page in paginator.paginate(Bucket=bucket_name):
+            for obj in page.get('Contents', []):
+                file_key = obj['Key']
+                transfer_file_to_smb(bucket_name, file_key, smb_path, use_timestamp, chunk_size_mb, prefixes=s3_prefixes, extensions=s3_extensions)
 
-        return {
-            'statusCode': 200,
-            'body': json.dumps("Processing complete.")
-        }
-
+        return {"statusCode": 200, "body": "Files transferred successfully."}
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        send_email_notification(
-            email_lambda_name,
-            email_recipients,
-            "Lambda Execution Error",
-            f"An error occurred during Lambda execution: {str(e)}"
-        )
-        return {
-            'statusCode': 500,
-            'body': json.dumps(f"Error: {str(e)}")
-        }
+        logger.error(f"Error in lambda handler: {e}", exc_info=True)
+        return {"statusCode": 500, "body": "Internal server error."}
+    finally:
+        logger.info("Lambda execution completed.")
